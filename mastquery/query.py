@@ -75,7 +75,13 @@ def _get_correct_exposure_times(tab, in_place=True):
     from astropy.table import Table
     
     url = "http://archive.stsci.edu/hst/search.php?action=Search&sci_data_set_name={datasets}&max_records=1000&outputformat=CSV"
-    dataset_list = [o[-18:-9] for o in tab['dataURL']]
+    #dataset_list = [o[-18:-9] for o in tab['dataURL']]
+    dataset_list = []
+    for o in tab['dataURL']:
+        try:
+            dataset_list.append(o[-18:-9])
+        except:
+            pass
     datasets = ','.join(dataset_list)
 
     query_url = url.format(datasets=datasets)
