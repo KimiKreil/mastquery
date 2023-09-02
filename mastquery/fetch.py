@@ -47,7 +47,10 @@ def make_curl_script(table, level=None, script_name=None, inst_products=DEFAULT_
     
     BASE_URL = 'http://archives.esac.esa.int/ehst-sl-server/servlet/data-action?ARTIFACT_ID=' #J6FL25S4Q_RAW.FITS'
     BASE_URL = 'http://hst.esac.esa.int/ehst-sl-server/servlet/data-action?ARTIFACT_ID=' #J6FL25S4Q_RAW.FITS'
-    
+    BASE_URL = 'https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:HST/product/'
+    # Make something like this;
+    # https://mast.stsci.edu/api/v0.1/Download/file?uri=mast:HST/product/icphd7doq_raw.fits
+
     if s3_sync:
         # s3://stpubdata/hst/public/icwb/icwb1iu5q/icwb1iu5q_raw.fits    
         BASE_URL = 's3://stpubdata/hst/public/'
@@ -96,7 +99,14 @@ def make_curl_script(table, level=None, script_name=None, inst_products=DEFAULT_
             curl_list = [make_s3_command(dataset, product, output_path=output_path, s3_sync=s3_sync) for dataset in table['observation_id']]
                 
         else:
-            curl_list = ['curl {0}{1}_{2}.FITS -o {5}/{3}_{4}.fits.gz'.format(BASE_URL, dataset.upper(), level.upper(), dataset.lower(), level.lower(), output_path) for dataset in table['observation_id']]
+            # curl_list = ['curl {0}{1}_{2}.FITS -o {5}/{3}_{4}.fits.gz'.format(BASE_URL, dataset.upper(), level.upper(), dataset.lower(), level.lower(), output_path) for dataset in table['observation_id']]
+            # TM;
+            curl_list = []
+            for dataset in table['observation_id']:
+                if dataset.lower()[:3] == 'hst':
+                    continue
+                curl_list.append('curl {0}{1}_{2}.fits -o {5}/{3}_{4}.fits.gz'.format(BASE_URL, dataset.lower(), level.lower(), dataset.lower(), level.lower(), output_path))
+
     
     if script_name is not None:
         fp = open(script_name, 'w')
