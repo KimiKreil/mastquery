@@ -6,15 +6,32 @@ import inspect
 import json
 
 import warnings
+import logging
+
 import numpy as np
 
 from astropy.table import Table
+
+LOGFILE = 'mastquery.log'
 
 INSTRUMENT_AREAS = {'WFC3/IR':4.5,
                     'WFPC2/WFC':8.,
                     'WFPC2/PC':8.,
                     'ACS/WFC':11.3,
-                    'WFC3/UVIS':7.3}
+                    'WFC3/UVIS':7.3,
+                    'NIRSPEC/IFU':0.00318, 
+                    'NIRSPEC/MSA':16,
+                    'NIRSPEC/SLIT':0.0002, 
+                    'NIRCAM/IMAGE':12.9,
+                    'NIRCAM/GRISM':11.8,
+                    'NIRISS/IMAGE':5.8,
+                    'MIRI/IMAGE':2.8,
+                    'MIRI/SLIT':0.0007,
+                    'MIRI/IFU':0.0037, 
+                    'MIRI':2.8*0.001, # Todo - parse mode e.g IFU
+                    'NIRISS':5.8*0.001, 
+                    'NIRCAM':4.8/2.*0.001,
+                    'NIRSPEC':12*0.00000001}
 
 # character to skip clearing line on STDOUT printing
 NO_NEWLINE = '\x1b[1A\x1b[1M'
@@ -164,10 +181,434 @@ def mastJson2Table(jsonObj):
             atype="str"
         if atype=="boolean":
             atype="bool"
-        dataTable[col] = np.array([x.get(col,None) for x in jsonObj['data']],dtype=atype)
+        dataTable[col] = np.array([x.get(col,None) for x in jsonObj['data']])
         
     return dataTable
-###############
+
+
+def new_mast_query(request):
+    """Perform a MAST query
+    
+    From https://mast.stsci.edu/api/v0/MastApiTutorial.html
+    
+    Parameters
+    ----------
+    request : dict
+        The MAST request json object
+
+    Returns
+    -------
+    head : str
+        Response HTTP header
+    
+    content : str
+        Returned data
+    """
+    import sys
+    import json
+    import requests
+    from urllib.parse import quote as urlencode
+    
+    # Base API url
+    request_url='https://mast.stsci.edu/api/v0/invoke'    
+    
+    # Grab Python Version 
+    version = ".".join(map(str, sys.version_info[:3]))
+
+    # Create Http Header Variables
+    headers = {"Content-type": "application/x-www-form-urlencoded",
+               "Accept": "text/plain",
+               "User-agent":"python-requests/"+version}
+
+    # Encoding the request as a json string
+    req_string = json.dumps(request)
+    req_string = urlencode(req_string)
+    
+    # Perform the HTTP request
+    resp = requests.post(request_url, data="request="+req_string, headers=headers)
+    
+    # Pull out the headers and response content
+    head = resp.headers
+    content = resp.content.decode('utf-8')
+
+    return head, content
+
+
+def new_mastJson2Table(query_content):
+    """
+    Convert json query content to table
+    """
+    import json
+    from astropy.table import Table
+    
+    json_data = json.loads(query_content)
+    #print('xxx', json_data.keys())
+    
+    tabs = []
+    for jdata in json_data['Tables']:
+        cols = [c['name'] for c in jdata['Fields']]
+        tab = Table(names=cols, rows=jdata['Rows'])
+        tabs.append(tab)
+    
+    if len(tabs) == 1:
+        return tabs[0]
+    else:
+        return tabs
+
+
+def split_rateints(file, verbose=True, overwrite=False, sigma_clip=4):
+    """
+    Combine integrations in a ``rateints`` file with sigma clipping
+    """
+    import astropy.io.fits as pyfits
+    from astropy.table import Table
+
+    ints = pyfits.open(file)
+    
+    if 'INT_TIMES' not in ints:
+        msg = f'mastquery.utils.split_rateints: INT_TIMES not found in {file}, skip'
+        log_comment(LOGFILE, msg, verbose=verbose)
+        return None
+        
+    N = ints[0].header['NINTS']
+    
+    msg = f'mastquery.utils.split_rateints: {file} NINTS={N} sigma_clip={sigma_clip}'
+    log_comment(LOGFILE, msg, verbose=verbose)
+    
+    out = file.replace('_rateints.fits', '_rate.fits')
+    
+    # Array copies
+    sci = ints['SCI'].data*1
+    dq = ints['DQ'].data*1
+    err = ints['ERR'].data*1
+    var_poisson = ints['VAR_POISSON'].data*1
+    var_rnoise = ints['var_rnoise'].data*1
+    
+    ivar = 1/err**2
+    
+    mask = (dq & 1025) == 0
+    sci[~mask] = np.nan
+    ivar[~mask] = 0.
+    
+    ### sigma-clipping
+    med = np.nanmedian(sci, axis=0)
+    clip = (sci - med)*np.sqrt(ivar) > sigma_clip
+    ivar[clip] = 0
+    sci[~mask | clip] = 0
+    
+    ### Weighted combination
+    num = np.nansum(sci*ivar, axis=0)
+    den = np.nansum(ivar, axis=0)
+    avg = num/den
+    err = 1/np.sqrt(den)
+    
+    ### Update variances
+    var_poisson[~mask | clip] = np.nan
+    var_rnoise[~mask | clip] = np.nan
+    var_poisson = 1/np.nansum(1./var_poisson, axis=0)
+    var_rnoise = 1/np.nansum(1./var_rnoise, axis=0)
+    
+    ### Combined DQ 
+    dqe = dq[0,:,:]*(~mask | clip)[0,:,:]
+    for i in range(N):
+        dqe |= dq[i,:,:]*(~mask | clip)[i,:,:]
+    
+    ### valid data
+    valid = np.isfinite(avg + err + var_poisson + var_rnoise)
+    avg[~valid] = 0
+    err[~valid] = 0
+    var_poisson[~valid] = 0
+    var_rnoise[~valid] = 0
+    dqe[~valid] |= 1
+    
+    ### Update FITS arrays and header
+    ints['SCI'].data = avg
+    ints['ERR'].data = err
+    ints['DQ'].data = dqe
+    ints['VAR_POISSON'].data = var_poisson
+    ints['VAR_RNOISE'].data = var_rnoise
+    
+    ints[0].header['DATAMODL'] = 'ImageModel'
+    ints[0].header['FILENAME'] = out
+    
+    ints.writeto(out, overwrite=True)
+    ints.close()
+    
+    return [out]
+    
+    # # variances
+    # for i in range(N):
+    #     for inst in ['_nrc','_nis','_mir','_nrs']:
+    #         out = out.replace(inst, labels[i] + inst)
+    #
+    #     if os.path.exists(out) & (not overwrite):
+    #         msg = f'mastquery.utils.split_rateints: {i} {out} - skip with overwrite=False'
+    #         log_comment(LOGFILE, msg, verbose=verbose)
+    #         out_files.append(out)
+    #
+    #         continue
+    #
+    #     msg = f'mastquery.utils.split_rateints: {i} {out}'
+    #     log_comment(LOGFILE, msg, verbose=verbose)
+    #
+    #     with pyfits.open(file) as im:
+    #         for ext in ['SCI','ERR','DQ','VAR_POISSON','VAR_RNOISE']:
+    #             im[ext].data = im[ext].data[i,:,:]
+    #
+    #         im[0].header['DATAMODL'] = 'ImageModel'
+    #         im[0].header['FILENAME'] = out
+    #
+    #         im[0].header['EFFEXPTM'] = dt[i]
+    #         im[0].header['EXPTIME'] = dt[i]
+    #
+    #         im[0].header['EXPSTART'] = times['int_start_MJD_UTC'][i]
+    #         im[0].header['EXPEND'] = times['int_end_MJD_UTC'][i]
+    #         im[0].header['NINTS'] = 1
+    #
+    #         im[1].header['MJD-BEG'] = times['int_start_MJD_UTC'][i]
+    #         im[1].header['MJD-AVG'] = times['int_mid_MJD_UTC'][i]
+    #         im[1].header['MJD-END'] = times['int_end_MJD_UTC'][i]
+    #
+    #         im[1].header['TDB-BEG'] = times['int_start_BJD_TDB'][i]
+    #         im[1].header['TDB-MID'] = times['int_mid_BJD_TDB'][i]
+    #         im[1].header['TDB-END'] = times['int_end_BJD_TDB'][i]
+    #         im[1].header['XPOSURE'] = dt[i]
+    #         im[1].header['TELAPSE'] = dt[i]
+    #
+    #         # hdul = pyfits.HDUList(im[0])
+    #         # for ext in ['SCI','ERR','DQ','VAR_POISSON','VAR_RNOISE','ASDF']:
+    #         #     hdul.append(im[ext])
+    #
+    #         im.writeto(out, overwrite=True)
+    #
+    #     out_files.append(out)
+    #
+    # ints.close()
+    # return out_files
+
+
+def download_from_mast(tab, path=None, verbose=True, overwrite=False, use_token=True, base_url=None, cloud_only=False, force_rate=False, rate_ints=False, **kwargs):
+    """
+    Download files from MAST API with `astroquery.mast.Observations.download_file`
+    
+    Parameters
+    ----------
+    tab : table, list
+        Table from MAST API query with minimal column ``dataURI``
+        or ``dataURL``.  If a `list`, then assumes they are strings of 
+        ``dataURL``/``dataURI`` names.
+    
+    path : str
+        Output path, defaults to current working diretory
+    
+    verbose : bool
+        Print status messages [deprecated, now uses `logging`]
+    
+    overwrite : bool
+        Overwrite existing files
+    
+    use_token : bool
+        Try to use a MAST token defined in a ``MAST_TOKEN`` environment 
+        variable.  See https://auth.mast.stsci.edu/info for info about the 
+        token authentication.
+    
+    base_url : str
+        A base url to use when downloading.  Default is the MAST Portal API
+    
+    cloud_only : bool
+        See `astroquery.mast.Observations.download_file`
+    
+    force_rate : bool
+        Replace 'cal' with 'rate' in filenames.
+    
+    rate_ints : bool
+        Fetch ``rateints`` files and split into individual ``rate`` files
+    
+    Returns
+    -------
+    resp : dict
+        Dict of responses from `astroquery.mast.Observations.download_file`
+        
+    """
+    from astroquery.mast import Observations
+    log = logging.getLogger()
+    
+    if (os.getenv('MAST_TOKEN') is None) | (not use_token):
+        session = Observations
+    else:
+        try:
+            session = Observations(mast_token=os.getenv('MAST_TOKEN'))
+        except:
+            session = Observations(token=os.getenv('MAST_TOKEN'))
+    
+    # Input is a list
+    if isinstance(tab, list):
+        tab = Table(names=['dataURI'], rows=[[u] for u in tab])
+    
+    if path is not None:
+        if not os.path.exists(path):
+            log.info(f'mkdir {path}')
+            os.makedirs(path)
+            
+    kws = {'local_path': path, 
+           'cache':(not overwrite), 
+           'base_url':base_url,
+           'cloud_only':cloud_only}
+    
+    resp = {}
+    for row in tab:     
+        if 'dataURI' in row.colnames:
+            _uri = row['dataURI']
+        else:
+            _uri = row['dataURL']
+
+        _file = os.path.basename(_uri)
+        if force_rate:
+            _file = _file.replace('_cal','_rate')
+            _uri = _uri.replace('_cal','_rate')
+        
+        if rate_ints:
+            _file = _file.replace('_cal','_rate')
+            _uri = _uri.replace('_cal','_rate')
+
+            _file = _file.replace('_rate.fits','_rateints.fits')
+            _uri = _uri.replace('_rate.fits','_rateints.fits')
+            
+        if path is None:
+            out_file = _file
+        else:
+            out_file = os.path.join(path, os.path.basename(_file))
+            kws['local_path'] = out_file
+            
+        if os.path.exists(out_file) & (not overwrite):
+            log.info(f'{out_file} exists, skip')
+            resp[out_file] = ('EXISTS', None, None)
+            
+            if rate_ints == 1:
+                out_rates = split_rateints(out_file, verbose=True)
+                for f in out_rates:
+                    resp[f] = ('EXISTS', None, None)
+            
+                _ = resp.pop(out_file)
+            
+            continue
+                
+        # Download the data
+        if _uri.startswith('jw'):
+            _uri = 'mast:JWST/product/'+_uri
+            
+        log.info(f"Download: {out_file}")
+             
+        payload = {"uri":_uri}        
+        resp[out_file] = session.download_file(_uri, **kws)
+        
+        if (rate_ints == 1) & os.path.exists(out_file):
+            out_rates = split_rateints(out_file, verbose=True)
+            for f in out_rates:
+                resp[f] = ('COMPLETE', None, None)
+            
+            _ = resp.pop(out_file)
+            
+    return resp
+
+
+def old_download_from_mast(tab, path='./', verbose=True, overwrite=True, min_size=1, delete_small=True):
+    """
+    Download files from MAST API
+    
+    Parameters
+    ----------
+    tab : table, list
+        Table from MAST API query with minimal column ``dataURI``
+        or ``dataURL``.  If a `list`, then assumes they are strings of 
+        ``dataURL``/``dataURI`` names.
+    
+    path : str
+        Output path
+    
+    verbose : bool
+        Print status messages [deprecated, now uses `logging`]
+    
+    overwrite : bool
+        Overwrite existing files
+    
+    min_size : float
+        Minimum size in megabits to check if the downloaded file is rather
+        an `Access Denied` file
+      
+    delete_small : bool
+        Remove the file if it failed the `min_size` test
+    
+    Returns
+    -------
+    outlist : list
+        List of valid downloaded files
+        
+    """
+    import requests
+    import os
+    log = logging.getLogger()
+    
+    download_url = 'https://mast.stsci.edu/api/v0.1/Download/file?'
+    
+    # Input is a list
+    if isinstance(tab, list):
+        tab = Table(names=['dataURI'], rows=[[u] for u in tab])
+        
+    if not os.path.exists(path):
+        log.info(f'mkdir {path}')
+        os.makedirs(path)
+    
+    outlist = []
+    
+    for row in tab:     
+        if 'dataURI' in row.colnames:
+            _uri = row['dataURI']
+        else:
+            _uri = row['dataURL']
+
+        if 'filename' in row.colnames:
+            _file = row['filename']
+        else:
+            _file = os.path.basename(_uri)
+            
+        out_file = os.path.join(path, os.path.basename(_file))
+        
+        if os.path.exists(out_file) & (not overwrite):
+            log.info(f'{out_file} exists, skip')
+            outlist.append(out_file)
+            continue
+                
+        # Download the data   
+        log.info(f"Download: {out_file}")
+             
+        payload = {"uri":_uri}        
+        resp = requests.get(download_url, params=payload)
+        
+        # save to file        
+        with open(out_file,'wb') as FLE:
+            FLE.write(resp.content)
+        
+        # check for file 
+        if not os.path.isfile(out_file):
+            # No file
+            msg = f'{out_file} failed to download.'
+            log.warning(msg)
+        else:
+            fs = os.path.getsize(out_file)/1e6
+            if fs < min_size:
+                msg = f"{out_file} is {fs:.1} Mb so is probably "
+                msg += "'Access Denied'"
+                log.warning(msg)
+                
+                if delete_small:
+                    os.remove(out_file)
+            else:
+                log.info(f"Complete: {out_file} ({fs:.1} Mb)")
+                outlist.append(out_file)
+    
+    return outlist
+
 
 def table_from_info(info):
     """
@@ -237,6 +678,7 @@ def set_warnings(numpy_level='ignore', astropy_level='ignore'):
     np.seterr(all=numpy_level)
     warnings.simplefilter(astropy_level, category=AstropyWarning)
 
+
 #########
 # Logging
 #########
@@ -273,7 +715,8 @@ def log_function_arguments(LOGFILE, frame, func='func', verbose=True):
     logstr = logstr.format(func, args)
     msg = log_comment(LOGFILE, logstr, verbose=verbose, show_date=True)
     return msg
-    
+
+
 def log_comment(LOGFILE, comment, verbose=False, show_date=False, mode='a'):
     """
     Log a message to a file, optionally including a date tag
@@ -294,8 +737,9 @@ def log_comment(LOGFILE, comment, verbose=False, show_date=False, mode='a'):
         fp.close()
     
     if verbose:
-        print(msg)
-        
+        print(msg[:-1])
+
+
 def log_exception(LOGFILE, traceback, verbose=True, mode='a'):
     """
     Log exception information to a file, or print to screen
@@ -338,7 +782,7 @@ def polygon_to_sregion(poly):
     Convert `shapely.Polygon` vertices to an SREGION string
     """
     try:
-        xy = np.array(poly.boundary.xy).T.flatten()
+        xy = np.array(poly.exterior.xy).T.flatten()
     except:
         xy = np.array(poly.convex_hull.boundary.xy).T.flatten()
     
@@ -353,7 +797,8 @@ def sregion_to_polygon(pstr):
     coo = np.cast[float](pstr.lower().strip('polygon(').strip(')').split(','))
     poly = Polygon(coo.reshape(-1,2))
     return poly
-    
+
+
 def radec_to_targname(ra=0, dec=0, round_arcsec=(4, 60), precision=2, targstr='j{rah}{ram}{ras}{sign}{ded}{dem}', header=None):
     """Turn decimal degree coordinates into a string with rounding.
     

@@ -29,6 +29,11 @@ MASTER_COLORS = {'G102':'#1f77b4',
 # Wide-field instruments
 ALL_INSTRUMENTS = ['WFC3/IR','WFC3/UVIS','ACS/HRC','ACS/WFC','WFPC2/PC','WFPC2/WFC']
 
+# JWST instruments
+JWST_IMAGING = ['NIRCAM/IMAGE', 'NIRISS/IMAGE', 'MIRI/IMAGE', 'NIRCAM/GRISM']
+MIRI_SPECTRA = ['MIRI/IFU', 'MIRI/SLIT', 'MIRI/SLITLESS'] 
+NIRSPEC_SPECTRA = ['NIRSPEC/IFU', 'NIRSPEC/MSA', 'NIRSPEC/SLIT']
+
 DEFAULT_RENAME = {'t_exptime':'exptime',
                   'target_name':'target',
                   's_region':'footprint', 
@@ -45,14 +50,34 @@ DEFAULT_COLUMN_FORMAT = {'t_min':'.4f',
 # Don't get calibrations.  Can't use "INTENT LIKE 'SCIENCE'" because some 
 # science observations are flagged as 'Calibration' in the ESA HSA.
 #DEFAULT_QUERY = {'project':['HST'], 'intentType':['science'], 'mtFlag':['False']}
-DEFAULT_QUERY = {'obs_collection':['HST'], 'intentType':['science'], 'mtFlag':['False']} #, 'dataRights':['PUBLIC']}
+# DEFAULT_QUERY = {'obs_collection':['HST'], 
+#                  'intentType':['science'], 
+#                  'mtFlag':['False']} 
+
+PUBLIC = {'dataRights':['PUBLIC']}
+
+DEFAULT_QUERY = {'intentType': ['science'], 
+                 'mtFlag': ['False'], 
+                 'obs_collection': ['HST'], 
+                 'project':['HST'], 
+                 't_exptime':[1,100000], # Some buggy exposures in database
+                 }
+
+JWST_QUERY = {'obs_collection': ['JWST']}
 
 # DEFAULT_EXTRA += ["TARGET.TARGET_NAME NOT LIKE '{0}'".format(calib) 
 #                  for calib in ['DARK','EARTH-CALIB', 'TUNGSTEN', 'BIAS',
 #                                'DARK-EARTH-CALIB', 'DARK-NM', 'DEUTERIUM',
 #                                'INTFLAT', 'KSPOTS', 'VISFLAT']]
 
-INSTRUMENT_DETECTORS = {'WFC3/UVIS':'UVIS', 'WFC3/IR':'IR', 'ACS/WFC':'WFC', 'ACS/HRC':'HRC', 'WFPC2':'1', 'STIS/NUV':'NUV-MAMA', 'STIS/ACQ':'CCD'}
+INSTRUMENT_DETECTORS = {'WFC3/UVIS':'UVIS', 
+                        'WFC3/IR':'IR', 
+                        'ACS/WFC':'WFC', 
+                        'ACS/HRC':'HRC', 
+                        'WFPC2':'1', 
+                        'STIS/NUV':'NUV-MAMA', 
+                        'STIS/ACQ':'CCD'}
+
 
 def get_correct_exposure_times(tab, in_place=True, ni=200):
     # Split into smaller groups
@@ -65,23 +90,19 @@ def get_correct_exposure_times(tab, in_place=True, ni=200):
         tab['exptime'].format = '.1f'
     else:
         return np.hstack(exptime)
-            
+
+
 def _get_correct_exposure_times(tab, in_place=True):
     """
-    Query direct from mast
+    Query direct from MAST http where association exposure times appear to be
+    more reliable than ``t_exptime`` in the database.
     """
     import os
     import time
     from astropy.table import Table
     
     url = "http://archive.stsci.edu/hst/search.php?action=Search&sci_data_set_name={datasets}&max_records=1000&outputformat=CSV"
-    #dataset_list = [o[-18:-9] for o in tab['dataURL']]
-    dataset_list = []
-    for o in tab['dataURL']:
-        try:
-            dataset_list.append(o[-18:-9])
-        except:
-            pass
+    dataset_list = [o[-18:-9] for o in tab['dataURL']]
     datasets = ','.join(dataset_list)
 
     query_url = url.format(datasets=datasets)
@@ -137,6 +158,8 @@ def get_products_table(query_tab, extensions=['RAW'], use_astroquery=True):
         force_manual = True
     
     if force_manual:
+        print('Query with `utils.mastQuery`')
+        
         request = {'service':'Mast.Caom.Products',
                'params':{'obsid':obsid},
                'format':'json',
@@ -147,7 +170,12 @@ def get_products_table(query_tab, extensions=['RAW'], use_astroquery=True):
         outData = json.loads(outString)
         prod_tab = utils.mastJson2Table(outData)
     
-    if np.cast[int](prod_tab['parent_obsid'].filled('0')).sum() == 0:
+    if hasattr(prod_tab['parent_obsid'], 'filled'):
+        obsint = np.cast[int](prod_tab['parent_obsid'].filled('0'))
+    else:
+        obsint = np.cast[int](prod_tab['parent_obsid'])
+        
+    if obsint.sum() == 0:
         print('MAST product database problem with ``parent_obsid``, try one-by-one...')
         # Problem with database, so query one by one
         prods = []
@@ -187,13 +215,9 @@ def get_products_table(query_tab, extensions=['RAW'], use_astroquery=True):
     return full_tab
 
 
-DEFAULT_QUERY_ASTROQUERY = {'intentType': ['science'], 'mtFlag': ['False'], 'obs_collection': ['HST']}
-
-JWST_QUERY = {'obs_collection': ['JWST']}
-
 def run_query(box=None, get_exptime=True, rename_columns=DEFAULT_RENAME,
               sort_column=['obs_id', 'filter'], position_box=True, 
-              base_query=DEFAULT_QUERY_ASTROQUERY.copy(), **kwargs):
+              base_query=DEFAULT_QUERY.copy(), **kwargs):
     """
     Run MAST query with astroquery.mast.  
     
@@ -363,7 +387,9 @@ def run_query_old(box=None, proposal_id=[13871], instruments=['WFC3/IR'], filter
 
 def modify_table(tab, get_exptime=True, rename_columns=DEFAULT_RENAME, 
                  sort_column=['obs_id', 'filter']):
-    
+    """
+    Rename columns and resort
+    """
     # Add coordinate name
     if 'ra' in tab.colnames:
         jtargname = [utils.radec_to_targname(ra=tab['ra'][i], dec=tab['dec'][i], round_arcsec=(4, 60), targstr='j{rah}{ram}{ras}{sign}{ded}{dem}') for i in range(len(tab))]
@@ -403,6 +429,9 @@ def modify_table(tab, get_exptime=True, rename_columns=DEFAULT_RENAME,
 
 
 def fix_byte_columns(tab):
+    """
+    Change byte columns to str
+    """
     for col in tab.colnames:
         try:
             if tab[col].dtype == np.dtype('O'):
@@ -411,7 +440,7 @@ def fix_byte_columns(tab):
                 tab[col] = strcol
         except:
             pass
-            
+
 
 def add_postcard(table, resolution=256):
     
@@ -423,8 +452,10 @@ def add_postcard(table, resolution=256):
    return True
    
    if False:
+       import grizli.utils
        tab = grizli.utils.GTable(table)
        tab['observation_id','filter','orientat','postcard'][tab['visit'] == 1].write_sortable_html('tab.html', replace_braces=True, localhost=True, max_lines=10000, table_id=None, table_class='display compact', css=None)
+
 
 NCIRCLE = 36
 THETA = np.linspace(0, 2*np.pi, NCIRCLE) 
@@ -433,6 +464,9 @@ YCIRCLE = np.sin(THETA)
 
 
 def parse_polygons(polystr):
+    """
+    Parse ``s_region`` strings to arrays
+    """
     from astropy.coordinates import Angle
     import astropy.units as u
     
@@ -457,9 +491,8 @@ def parse_polygons(polystr):
             except:
                 continue
         
-        
         try:
-            poly_i = np.cast[float](spl[ip:]).reshape((-1,2)) #[np.cast[float](p.split()).reshape((-1,2)) for p in spl]
+            poly_i = np.cast[float](spl[ip:]).reshape((-1,2))
         except:
             # Circle
             x0, y0, r0 = np.cast[float](spl[ip:])
@@ -476,7 +509,10 @@ def parse_polygons(polystr):
     return poly
 
 
-def instrument_polygon(tab_row, bad_area=0.3):
+TARGET_BUFFER = 16.
+DEBUG = False
+
+def instrument_polygon(tab_row, min_poly_area=0.01, bad_area=0.3):
     """
     Fix for bad footprints in MAST tables, perhaps from bad a posteriori 
     alignment
@@ -485,7 +521,7 @@ def instrument_polygon(tab_row, bad_area=0.3):
     import shapely.affinity
 
     pt = Point(tab_row['ra'], tab_row['dec'])
-    pt_buff = pt.buffer(16./60)
+    pt_buff = pt.buffer(TARGET_BUFFER/60)
     
     # Expected area, neglects subarrays
     if tab_row['instrument_name'] in utils.INSTRUMENT_AREAS:
@@ -511,9 +547,14 @@ def instrument_polygon(tab_row, bad_area=0.3):
         try:
             psh = Polygon(pi).buffer(0.01/60)
         except:
+            if DEBUG:
+                print('xx polygon failed')
             continue
         
-        if psh.intersection(pt_buff).area < 0.01/3600:
+        min_size = np.minimum(min_poly_area, 0.9*area)
+        if psh.intersection(pt_buff).area < min_size/3600:
+            if DEBUG:
+                print('xx too small',  psh.intersection(pt_buff).area, min_size/3600.)
             continue
         else:
             keep_poly.append(pi)
@@ -530,10 +571,14 @@ def instrument_polygon(tab_row, bad_area=0.3):
     # (a posteriori alignment problems?)
     IS_BAD = False
     if pshape is None:
+        if DEBUG:
+            print('xx pshape is None')
         print(msg)
         IS_BAD = True
     else:
         if pshape.area < bad_area*area/3600:
+            if DEBUG:
+                print('xx', pshape.area, bad_area, bad_area*area/3600)
             print(msg)
             IS_BAD = True
     
@@ -546,7 +591,7 @@ def instrument_polygon(tab_row, bad_area=0.3):
         keep_poly = [np.array(pshape.boundary.xy).T]
         
     return pshape, IS_BAD, keep_poly
-    
+
 
 def set_default_formats(table, formats=DEFAULT_COLUMN_FORMAT):
     """
@@ -562,7 +607,7 @@ def set_expstart(table):
     from astropy import time
     mjd = time.Time(table['t_min'], format='mjd')
     table['expstart'] = mjd.iso
-    
+
 
 def set_transformed_coordinates(table):
     """
@@ -618,7 +663,8 @@ def get_footprint_area(polystr='Polygon ICRS 127.465487 18.855605 127.425760 18.
     cosd = np.cos(px[0,1]/180*np.pi)
     area = poly.area*3600*cosd
     return area
-    
+
+
 def set_orientat_column(table):
     """
     Make a column in the `table` computing each orientation with
@@ -626,10 +672,10 @@ def set_orientat_column(table):
     """
     table['orientat'] = [get_orientat(p) for p in table['footprint']]
     table['orientat'].format = '.1f'
-    
+
+
 def get_orientat(polystr='Polygon ICRS 127.465487 18.855605 127.425760 18.853486 127.423118 18.887458 127.463833 18.889591'):
     """
-    
     Compute the "ORIENTAT" position angle (PA of the detector +y axis) from  
     the archive footprint, assuming that the first two entries of the polygon 
     are the LL and UL corners of the detector.
@@ -654,11 +700,15 @@ def get_orientat(polystr='Polygon ICRS 127.465487 18.855605 127.425760 18.853486
     orientat = 90+np.arctan2(dra, dde)/np.pi*180
     orientat -= 0.24 # small offset to better match header keywords
     
-    orientat = Angle.wrap_at(orientat*u.deg, 180*u.deg).value
-    
+    try:
+        orientat = Angle.wrap_at(orientat*u.deg, 180*u.deg).value
+    except AttributeError:
+        orientat = Angle(orientat*u.deg).wrap_at(180*u.deg).value
+        
     return orientat
-    
-def show_footprints(tab, ax=None, alpha=0.1):
+
+
+def show_footprints(tab, ax=None, alpha=0.1, bad_area=0.3):
     """
     Show pointing footprints in a plot
     """
@@ -681,7 +731,7 @@ def show_footprints(tab, ax=None, alpha=0.1):
         
     for i in range(len(tab)):
         #poly = parse_polygons(tab['footprint'][i])#[0]
-        pshape, is_bad, poly = instrument_polygon(tab[i])
+        pshape, is_bad, poly = instrument_polygon(tab[i], bad_area=bad_area)
             
         for p in poly:
             pclose = np.vstack([p, p[0,:]]) # repeat the first vertex to close
@@ -695,7 +745,8 @@ def show_footprints(tab, ax=None, alpha=0.1):
                        color=colors[tab['filter'][i]], alpha=alpha)
     
     return colors
-    
+
+
 def add_aladdin(tab, rd_cols=['ra', 'dec'], fov=0.5, size=(400,200), default_view="P/DSS2/color"):
     """
     Add AladinLite DIV column to the table
